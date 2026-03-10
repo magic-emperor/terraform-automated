@@ -6,6 +6,7 @@ import os
 import json
 import uuid
 import datetime
+import shutil
 
 app = FastAPI(title="Terraform Manager API")
 
@@ -80,20 +81,25 @@ async def stream_subprocess(cmd: str, cwd: str, session_id: str, stage: str):
 async def execute_terraform_deploy(session_id: str, tf_dir: str, destroy_in_seconds: int):
     # Update state
     deployments[session_id] = {"status": "Deploying", "tf_dir": tf_dir}
+    
+    # Fallback to absolute path if not in system PATH
+    tf_cmd = "terraform"
+    if not shutil.which("terraform"):
+        tf_cmd = "D:/Downloads/terraform_1.14.6_amd64/terraform.exe"
 
     try:
         # 1. Initialize
-        code = await stream_subprocess("terraform init", tf_dir, session_id, "Initializing")
+        code = await stream_subprocess(f"{tf_cmd} init", tf_dir, session_id, "Initializing")
         if code != 0:
             raise Exception("Terraform init failed")
 
         # 2. Plan
-        code = await stream_subprocess("terraform plan -out=tfplan", tf_dir, session_id, "Planning")
+        code = await stream_subprocess(f"{tf_cmd} plan -out=tfplan", tf_dir, session_id, "Planning")
         if code != 0:
             raise Exception("Terraform plan failed")
 
         # 3. Apply
-        code = await stream_subprocess("terraform apply -auto-approve tfplan", tf_dir, session_id, "Applying")
+        code = await stream_subprocess(f"{tf_cmd} apply -auto-approve tfplan", tf_dir, session_id, "Applying")
         if code != 0:
             raise Exception("Terraform apply failed")
 
@@ -122,8 +128,12 @@ async def execute_terraform_destroy(session_id: str, tf_dir: str):
     # Check if actually deployed
     deployments[session_id]["status"] = "Destroying"
     
+    tf_cmd = "terraform"
+    if not shutil.which("terraform"):
+        tf_cmd = "D:/Downloads/terraform_1.14.6_amd64/terraform.exe"
+    
     try:
-        code = await stream_subprocess("terraform destroy -auto-approve", tf_dir, session_id, "Destroying")
+        code = await stream_subprocess(f"{tf_cmd} destroy -auto-approve", tf_dir, session_id, "Destroying")
         if code != 0:
             raise Exception("Terraform destroy failed")
             
