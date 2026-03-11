@@ -3,10 +3,13 @@ from fastapi import FastAPI, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
+import sys
 import json
 import uuid
 import datetime
 import shutil
+import subprocess
+import threading
 
 app = FastAPI(title="Terraform Manager API")
 
@@ -52,31 +55,70 @@ async def stream_subprocess(cmd: str, cwd: str, session_id: str, stage: str):
     """Run a subprocess and stream its output to websockets."""
     await manager.broadcast({"type": "stage_update", "session_id": session_id, "stage": stage})
     
-    try:
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            cwd=cwd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except Exception as e:
-        await manager.broadcast({"type": "log", "session_id": session_id, "stage": stage, "stream": "stderr", "text": f"Failed to start process: {e}"})
-        return -1
+    def run_process():
+        import shlex
+        cmd_parts = shlex.split(cmd)
+        print(f"Executing: {cmd_parts} in {cwd}")
+        try:
+            process = subprocess.Popen(
+                cmd_parts,
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            return process
+        except Exception as e:
+            return e
+            
+    # Start it on a thread to avoid blocking the loop during creation
+    main_loop = asyncio.get_running_loop()
+    process_or_err = await asyncio.to_thread(run_process)
     
-    async def read_stream(stream, stream_type):
-        while True:
-            line = await stream.readline()
+    if isinstance(process_or_err, Exception):
+        import traceback
+        err_msg = f"Failed to start process: {process_or_err}. Traceback: {traceback.format_exc()}"
+        print(err_msg)
+        if "logs" not in deployments[session_id]:
+            deployments[session_id]["logs"] = []
+        deployments[session_id]["logs"].append(f"[stderr] {err_msg}")
+        asyncio.run_coroutine_threadsafe(
+            manager.broadcast({"type": "log", "session_id": session_id, "stage": stage, "stream": "stderr", "text": err_msg}),
+            main_loop
+        )
+        return -1
+        
+    process = process_or_err
+    
+    def read_stream_sync(stream, stream_type, loop):
+        for line in iter(stream.readline, ""):
             if not line:
                 break
-            text = line.decode('utf-8').rstrip()
-            await manager.broadcast({"type": "log", "session_id": session_id, "stage": stage, "stream": stream_type, "text": text})
+            text = line.rstrip()
+            if "logs" not in deployments[session_id]:
+                deployments[session_id]["logs"] = []
+            deployments[session_id]["logs"].append(f"[{stream_type}] {text}")
+            # Schedule the websocket broadcast back on the main loop
+            asyncio.run_coroutine_threadsafe(
+                manager.broadcast({"type": "log", "session_id": session_id, "stage": stage, "stream": stream_type, "text": text}),
+                loop
+            )
 
-    await asyncio.gather(
-        read_stream(process.stdout, "stdout"),
-        read_stream(process.stderr, "stderr")
-    )
-    await process.wait()
-    return process.returncode
+    # Use native threads to read the blocking output
+    stdout_thread = threading.Thread(target=read_stream_sync, args=(process.stdout, "stdout", main_loop))
+    stderr_thread = threading.Thread(target=read_stream_sync, args=(process.stderr, "stderr", main_loop))
+    
+    stdout_thread.start()
+    stderr_thread.start()
+    
+    def wait_process():
+        process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        return process.returncode
+        
+    code = await asyncio.to_thread(wait_process)
+    return code
 
 async def execute_terraform_deploy(session_id: str, tf_dir: str, destroy_in_seconds: int):
     # Update state
@@ -86,22 +128,29 @@ async def execute_terraform_deploy(session_id: str, tf_dir: str, destroy_in_seco
     tf_cmd = "terraform"
     if not shutil.which("terraform"):
         tf_cmd = "D:/Downloads/terraform_1.14.6_amd64/terraform.exe"
+        print(f"Using manual terraform path: {tf_cmd}")
 
     try:
         # 1. Initialize
         code = await stream_subprocess(f"{tf_cmd} init", tf_dir, session_id, "Initializing")
         if code != 0:
-            raise Exception("Terraform init failed")
+            err_msg = "\n".join(deployments[session_id].get("logs", []))
+            print(f"Init Error: {err_msg}")
+            raise Exception(f"Terraform init failed. Code: {code}. Logs: {err_msg}")
 
         # 2. Plan
         code = await stream_subprocess(f"{tf_cmd} plan -out=tfplan", tf_dir, session_id, "Planning")
         if code != 0:
-            raise Exception("Terraform plan failed")
+            err_msg = "\n".join(deployments[session_id].get("logs", []))
+            print(f"Plan Error: {err_msg}")
+            raise Exception(f"Terraform plan failed. Code: {code}. Logs: {err_msg}")
 
         # 3. Apply
         code = await stream_subprocess(f"{tf_cmd} apply -auto-approve tfplan", tf_dir, session_id, "Applying")
         if code != 0:
-            raise Exception("Terraform apply failed")
+            err_msg = "\n".join(deployments[session_id].get("logs", []))
+            print(f"Apply Error: {err_msg}")
+            raise Exception(f"Terraform apply failed. Code: {code}. Logs: {err_msg}")
 
         # Success - Active
         destroy_at = datetime.datetime.now() + datetime.timedelta(seconds=destroy_in_seconds)
