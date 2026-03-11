@@ -125,6 +125,10 @@ async def execute_terraform_deploy(session_id: str, tf_dir: str, destroy_in_seco
     deployments[session_id] = {"status": "Deploying", "tf_dir": tf_dir}
     
     # Fallback to absolute path if not in system PATH
+    # NOTE: This fallback path 'D:/Downloads/terraform_1.14.6_amd64/terraform.exe' 
+    # was added as a failsafe during local development because the system environment PATH 
+    # wasn't refreshing properly. On a different machine, as long as Terraform is installed 
+    # and in the global PATH, it will automatically route through `tf_cmd = "terraform"` perfectly fine!
     tf_cmd = "terraform"
     if not shutil.which("terraform"):
         tf_cmd = "D:/Downloads/terraform_1.14.6_amd64/terraform.exe"
@@ -177,6 +181,8 @@ async def execute_terraform_destroy(session_id: str, tf_dir: str):
     # Check if actually deployed
     deployments[session_id]["status"] = "Destroying"
     
+    # Fallback to absolute path if not in system PATH
+    # NOTE: Same failsafe as in `execute_terraform_deploy`.
     tf_cmd = "terraform"
     if not shutil.which("terraform"):
         tf_cmd = "D:/Downloads/terraform_1.14.6_amd64/terraform.exe"
